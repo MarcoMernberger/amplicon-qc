@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+
+# Rust generated lock file
+# Nur ignorieren, wenn es sich um eine Library handelt.
+# Für eine Binary/Application sollte Cargo.lock committed werden.
+# /Cargo.lock
+
+# IDE / Editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local environment / secrets
+.env
+.env.*
+
+# Generated analysis output
+*.tsv
+*.csv
+*.svg
+
+# FASTQ / sequencing data
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+
+# Temporary files
+*.tmp
+*.temp
+*.log
