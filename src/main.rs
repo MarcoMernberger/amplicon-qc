@@ -623,96 +623,77 @@ fn reads_are_swapped(
             r1_sequence,
             start_flanks,
             max_hamming,
-        );
+        )
+        .is_some();
 
-    let r1_end =
-        find_forward_end(
+    let r1_rev_end =
+        find_reverse_end(
             r1_sequence,
             end_flanks,
             max_hamming,
-        );
+        )
+        .is_some();
 
     let r2_start =
         find_forward_start(
             r2_sequence,
             start_flanks,
             max_hamming,
-        );
+        )
+        .is_some();
 
-    let r2_end =
-        find_forward_end(
+    let r2_rev_end =
+        find_reverse_end(
             r2_sequence,
             end_flanks,
             max_hamming,
-        );
+        )
+        .is_some();
 
     /*
-     * Lower score = better match.
-     *
-     * Missing match gets a large penalty.
-     */
-    let penalty = max_hamming + 1;
-
-    let match_score =
-        |m: &Option<FlankMatch>| -> usize {
-            match m {
-                Some(m) => m.hamming_distance,
-                None => penalty,
-            }
-        };
-
-    /*
-     * Canonical:
+     * Strong canonical evidence:
      *
      *     R1 = START
-     *     R2 = END
+     *     R2 = revEND
      */
-    let canonical_score =
-        match_score(&r1_start)
-        + match_score(&r2_end);
+    let canonical =
+        r1_start && r2_rev_end;
 
     /*
-     * Swapped:
+     * Strong swapped evidence:
      *
-     *     R1 = END
+     *     R1 = revEND
      *     R2 = START
      */
-    let swapped_score =
-        match_score(&r1_end)
-        + match_score(&r2_start);
-
-    /*
-     * Swap only when the swapped orientation is
-     * strictly better.
-     */
     let swapped =
-        swapped_score < canonical_score;
+        r1_rev_end && r2_start;
 
     eprintln!(
-        "Orientation check: \
-         R1_START={:?}, R1_END={:?}, \
-         R2_START={:?}, R2_END={:?}, \
-         canonical_score={}, swapped_score={}, \
+        "Orientation: \
+         R1_START={} \
+         R1_revEND={} \
+         R2_START={} \
+         R2_revEND={} \
+         canonical={} \
          swapped={}",
-        r1_start
-            .as_ref()
-            .map(|m| m.hamming_distance),
-        r1_end
-            .as_ref()
-            .map(|m| m.hamming_distance),
-        r2_start
-            .as_ref()
-            .map(|m| m.hamming_distance),
-        r2_end
-            .as_ref()
-            .map(|m| m.hamming_distance),
-        canonical_score,
-        swapped_score,
+        r1_start,
+        r1_rev_end,
+        r2_start,
+        r2_rev_end,
+        canonical,
         swapped,
     );
 
-    swapped
+    /*
+     * Only swap when the evidence specifically supports
+     * the swapped arrangement.
+     *
+     * If neither arrangement is clear, leave the reads
+     * untouched rather than guessing.
+     */
+    swapped && !canonical
 }
+
 /// Classify canonical R1.
 ///
 /// Expected:
@@ -746,8 +727,7 @@ fn classify_r1(
     end_flanks: &[Flank],
     max_hamming: usize,
 ) -> R1Result {
-    let read_length =
-        sequence.len();
+    let read_length = sequence.len();
 
     let start =
         find_forward_start(
@@ -758,19 +738,11 @@ fn classify_r1(
 
     match start {
         None => {
-            let reverse_end =
-                find_reverse_end(
-                    sequence,
-                    end_flanks,
-                    max_hamming,
-                );
-
             R1Result {
                 category: "None",
                 start: None,
-                reverse_end,
-                observed_length:
-                    read_length,
+                reverse_end: None,
+                observed_length: read_length,
             }
         }
 
@@ -780,49 +752,65 @@ fn classify_r1(
 
             let start_end =
                 start.position
-                    + start
-                        .matched_sequence
-                        .len();
+                    + start.matched_sequence.len();
 
-            let reverse_end =
+            /*
+             * R1 is sequenced in the forward biological
+             * orientation:
+             *
+             *     START -> INSERT -> END
+             *
+             * Therefore END is searched FORWARD.
+             */
+            let end =
                 find_best_flank_from(
                     sequence,
                     end_flanks,
-                    true,
+                    false,
                     max_hamming,
                     start_end,
                 );
 
-            match reverse_end {
-                None => R1Result {
-                    category: "R1_START",
-                    start: Some(start),
-                    reverse_end: None,
-                    observed_length:
-                        read_length
-                            .saturating_sub(
-                                start_pos
-                            ),
-                },
+            match end {
+                None => {
+                    R1Result {
+                        category: "R1_START",
 
-                Some(reverse_end) => R1Result {
-                    category:
-                        "R1_START_revEND",
-                    start: Some(start),
-                    reverse_end:
-                        Some(reverse_end.clone()),
-                    observed_length:
-                        reverse_end
-                            .position
-                            .saturating_sub(
-                                start_pos
-                            ),
-                },
+                        start: Some(start),
+
+                        reverse_end: None,
+
+                        observed_length:
+                            read_length
+                                .saturating_sub(start_pos),
+                    }
+                }
+
+                Some(end) => {
+                    let observed_length =
+                        end.position
+                            .saturating_sub(start_pos);
+
+                    R1Result {
+                        category:
+                            "R1_START_revEND",
+
+                        start: Some(start),
+
+                        /*
+                         * Struct field name is now misleading.
+                         * This is actually a forward END.
+                         */
+                        reverse_end:
+                            Some(end),
+
+                        observed_length,
+                    }
+                }
             }
         }
     }
 }
-
 
 /// Classify canonical R2.
 ///
@@ -857,31 +845,29 @@ fn classify_r2(
     end_flanks: &[Flank],
     max_hamming: usize,
 ) -> R2Result {
-    let read_length =
-        sequence.len();
+    let read_length = sequence.len();
 
+    /*
+     * R2 starts at the opposite strand.
+     *
+     * Therefore the END flank appears as
+     * reverse-complement END.
+     */
     let end =
-        find_forward_end(
+        find_best_flank(
             sequence,
             end_flanks,
+            true,
             max_hamming,
         );
 
     match end {
         None => {
-            let reverse_start =
-                find_reverse_start(
-                    sequence,
-                    start_flanks,
-                    max_hamming,
-                );
-
             R2Result {
                 category: "None",
                 end: None,
-                reverse_start,
-                observed_length:
-                    read_length,
+                reverse_start: None,
+                observed_length: read_length,
             }
         }
 
@@ -891,10 +877,13 @@ fn classify_r2(
 
             let end_end =
                 end.position
-                    + end
-                        .matched_sequence
-                        .len();
+                    + end.matched_sequence.len();
 
+            /*
+             * After reverse-complement END,
+             * R2 continues through the insert and
+             * eventually reaches reverse-complement START.
+             */
             let reverse_start =
                 find_best_flank_from(
                     sequence,
@@ -905,30 +894,37 @@ fn classify_r2(
                 );
 
             match reverse_start {
-                None => R2Result {
-                    category: "R2_END",
-                    end: Some(end),
-                    reverse_start: None,
-                    observed_length:
-                        read_length
-                            .saturating_sub(
-                                end_pos
-                            ),
-                },
+                None => {
+                    R2Result {
+                        category: "R2_END",
 
-                Some(reverse_start) => R2Result {
-                    category:
-                        "R2_END_revSTART",
-                    end: Some(end),
-                    reverse_start:
-                        Some(reverse_start.clone()),
-                    observed_length:
-                        reverse_start
-                            .position
-                            .saturating_sub(
-                                end_pos
-                            ),
-                },
+                        end: Some(end),
+
+                        reverse_start: None,
+
+                        observed_length:
+                            read_length
+                                .saturating_sub(end_pos),
+                    }
+                }
+
+                Some(reverse_start) => {
+                    let observed_length =
+                        reverse_start.position
+                            .saturating_sub(end_pos);
+
+                    R2Result {
+                        category:
+                            "R2_END_revSTART",
+
+                        end: Some(end),
+
+                        reverse_start:
+                            Some(reverse_start),
+
+                        observed_length,
+                    }
+                }
             }
         }
     }
