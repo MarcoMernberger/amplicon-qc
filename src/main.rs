@@ -1090,19 +1090,19 @@ fn process(
         "r1_start_match",
         "r1_start_hamming",
 
-        "r1_rev_end_flank",
-        "r1_rev_end_position",
-        "r1_rev_end_match",
-        "r1_rev_end_hamming",
+        "r1_end_flank",
+        "r1_end_position",
+        "r1_end_match",
+        "r1_end_hamming",
 
         "r1_length",
 
         "r2_category",
 
-        "r2_end_flank",
-        "r2_end_position",
-        "r2_end_match",
-        "r2_end_hamming",
+        "r2_rev_end_flank",
+        "r2_rev_end_position",
+        "r2_rev_end_match",
+        "r2_rev_end_hamming",
 
         "r2_rev_start_flank",
         "r2_rev_start_position",
