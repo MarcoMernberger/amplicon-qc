@@ -404,6 +404,24 @@ fn find_best_flank(
     reverse_complemented: bool,
     max_hamming: usize,
 ) -> Option<FlankMatch> {
+    find_best_flank_from(
+        sequence,
+        flanks,
+        reverse_complemented,
+        max_hamming,
+        0,
+    )
+}
+
+
+/// Find the best flank match at or after `min_position`.
+fn find_best_flank_from(
+    sequence: &[u8],
+    flanks: &[Flank],
+    reverse_complemented: bool,
+    max_hamming: usize,
+    min_position: usize,
+) -> Option<FlankMatch> {
     let mut best:
         Option<FlankMatch> =
         None;
@@ -428,8 +446,15 @@ fn find_best_flank(
             continue;
         }
 
+        if min_position
+            > sequence.len() - k
+        {
+            continue;
+        }
+
         for position in
-            0..=(sequence.len() - k)
+            min_position
+                ..=(sequence.len() - k)
         {
             let candidate =
                 &sequence[
@@ -690,128 +715,68 @@ fn classify_r1(
             max_hamming,
         );
 
-    let reverse_end =
-        find_reverse_end(
-            sequence,
-            end_flanks,
-            max_hamming,
-        );
-
     match start {
         None => {
-            /*
-             * There is no canonical START forward flank.
-             *
-             * We call this None, even if an unexpected reverse
-             * END happens to occur. Such unexpected matches remain
-             * visible in the TSV.
-             */
+            let reverse_end =
+                find_reverse_end(
+                    sequence,
+                    end_flanks,
+                    max_hamming,
+                );
+
             R1Result {
                 category: "None",
-
                 start: None,
-
                 reverse_end,
-
                 observed_length:
                     read_length,
             }
         }
 
         Some(start) => {
+            let start_pos =
+                start.position;
+
+            let start_end =
+                start.position
+                    + start
+                        .matched_sequence
+                        .len();
+
+            let reverse_end =
+                find_best_flank_from(
+                    sequence,
+                    end_flanks,
+                    true,
+                    max_hamming,
+                    start_end,
+                );
+
             match reverse_end {
-                None => {
-                    /*
-                     * START is present but the read ends before
-                     * reaching reverse END.
-                     */
-                    R1Result {
-                        category: "R1_START",
+                None => R1Result {
+                    category: "R1_START",
+                    start: Some(start),
+                    reverse_end: None,
+                    observed_length:
+                        read_length
+                            .saturating_sub(
+                                start_pos
+                            ),
+                },
 
-                        start:
-                            Some(start),
-
-                        reverse_end:
-                            None,
-
-                        observed_length:
-                            read_length,
-                    }
-                }
-
-                Some(reverse_end) => {
-                    /*
-                     * Length is the complete sequence from
-                     * read start through the END of reverse END.
-                     *
-                     * Example:
-                     *
-                     * START = positions 0..20
-                     * insert = positions 20..100
-                     * revEND = positions 100..120
-                     *
-                     * length = 120
-                     */
-                    let reverse_end_end =
-                        reverse_end.position
-                            + reverse_end
-                                .matched_sequence
-                                .len();
-
-                    /*
-                     * Only call this a valid R1_START_revEND
-                     * arrangement if reverse END occurs after
-                     * START.
-                     *
-                     * This prevents a reverse END occurring
-                     * upstream from being interpreted as the
-                     * downstream flank.
-                     */
-                    let start_end =
-                        start.position
-                            + start
-                                .matched_sequence
-                                .len();
-
-                    if reverse_end.position
-                        >= start_end
-                    {
-                        R1Result {
-                            category:
-                                "R1_START_revEND",
-
-                            start:
-                                Some(start),
-
-                            reverse_end:
-                                Some(reverse_end),
-
-                            observed_length:
-                                reverse_end_end,
-                        }
-                    } else {
-                        /*
-                         * Reverse END exists, but not in the
-                         * expected downstream position.
-                         *
-                         * We therefore retain the START-only
-                         * classification.
-                         */
-                        R1Result {
-                            category:
-                                "R1_START",
-
-                            start:
-                                Some(start),
-
-                            reverse_end:
-                                Some(reverse_end),
-
-                            observed_length:
-                                read_length,
-                        }
-                    }
-                }
+                Some(reverse_end) => R1Result {
+                    category:
+                        "R1_START_revEND",
+                    start: Some(start),
+                    reverse_end:
+                        Some(reverse_end.clone()),
+                    observed_length:
+                        reverse_end
+                            .position
+                            .saturating_sub(
+                                start_pos
+                            ),
+                },
             }
         }
     }
@@ -861,110 +826,68 @@ fn classify_r2(
             max_hamming,
         );
 
-    let reverse_start =
-        find_reverse_start(
-            sequence,
-            start_flanks,
-            max_hamming,
-        );
-
     match end {
         None => {
-            /*
-             * No canonical END forward flank.
-             *
-             * Again, an unexpected reverse START is retained
-             * in the TSV if present.
-             */
+            let reverse_start =
+                find_reverse_start(
+                    sequence,
+                    start_flanks,
+                    max_hamming,
+                );
+
             R2Result {
                 category: "None",
-
                 end: None,
-
                 reverse_start,
-
                 observed_length:
                     read_length,
             }
         }
 
         Some(end) => {
+            let end_pos =
+                end.position;
+
+            let end_end =
+                end.position
+                    + end
+                        .matched_sequence
+                        .len();
+
+            let reverse_start =
+                find_best_flank_from(
+                    sequence,
+                    start_flanks,
+                    true,
+                    max_hamming,
+                    end_end,
+                );
+
             match reverse_start {
-                None => {
-                    /*
-                     * END is present but reverse START is not
-                     * reached within the read.
-                     */
-                    R2Result {
-                        category:
-                            "R2_END",
+                None => R2Result {
+                    category: "R2_END",
+                    end: Some(end),
+                    reverse_start: None,
+                    observed_length:
+                        read_length
+                            .saturating_sub(
+                                end_pos
+                            ),
+                },
 
-                        end:
-                            Some(end),
-
-                        reverse_start:
-                            None,
-
-                        observed_length:
-                            read_length,
-                    }
-                }
-
-                Some(reverse_start) => {
-                    let reverse_start_end =
-                        reverse_start.position
-                            + reverse_start
-                                .matched_sequence
-                                .len();
-
-                    let end_end =
-                        end.position
-                            + end
-                                .matched_sequence
-                                .len();
-
-                    /*
-                     * Reverse START must occur downstream
-                     * of forward END.
-                     */
-                    if reverse_start.position
-                        >= end_end
-                    {
-                        R2Result {
-                            category:
-                                "R2_END_revSTART",
-
-                            end:
-                                Some(end),
-
-                            reverse_start:
-                                Some(reverse_start),
-
-                            observed_length:
-                                reverse_start_end,
-                        }
-                    } else {
-                        /*
-                         * Reverse START exists but is upstream
-                         * of the expected END.
-                         *
-                         * Retain END-only classification.
-                         */
-                        R2Result {
-                            category:
-                                "R2_END",
-
-                            end:
-                                Some(end),
-
-                            reverse_start:
-                                Some(reverse_start),
-
-                            observed_length:
-                                read_length,
-                        }
-                    }
-                }
+                Some(reverse_start) => R2Result {
+                    category:
+                        "R2_END_revSTART",
+                    end: Some(end),
+                    reverse_start:
+                        Some(reverse_start.clone()),
+                    observed_length:
+                        reverse_start
+                            .position
+                            .saturating_sub(
+                                end_pos
+                            ),
+                },
             }
         }
     }
@@ -1130,11 +1053,6 @@ fn process(
         "r1_start_match",
         "r1_start_hamming",
 
-        "r1_end_flank",
-        "r1_end_position",
-        "r1_end_match",
-        "r1_end_hamming",
-
         "r1_rev_end_flank",
         "r1_rev_end_position",
         "r1_rev_end_match",
@@ -1143,11 +1061,6 @@ fn process(
         "r1_length",
 
         "r2_category",
-
-        "r2_start_flank",
-        "r2_start_position",
-        "r2_start_match",
-        "r2_start_hamming",
 
         "r2_end_flank",
         "r2_end_position",
@@ -1449,11 +1362,6 @@ fn process(
                     r1_result.reverse_end.as_ref(),
                 )?;
 
-                write_optional_match(
-                    &mut writer,
-                    r1_result.reverse_end.as_ref(),
-                )?;
-
                 writer.write_field(
                     r1_length
                         .to_string()
@@ -1471,11 +1379,6 @@ fn process(
                 write_optional_match(
                     &mut writer,
                     r2_result.end.as_ref(),
-                )?;
-
-                write_optional_match(
-                    &mut writer,
-                    r2_result.reverse_start.as_ref(),
                 )?;
 
                 write_optional_match(
