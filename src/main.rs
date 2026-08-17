@@ -1043,6 +1043,39 @@ fn write_optional_match(
 }
 
 
+/// Compute observed amplicon length from flank positions.
+///
+/// Defaults:
+///
+///     start_pos = 0 if start flank is absent
+///     end_pos = read_length if end flank is absent
+///
+/// If an end flank is present but upstream of start, it is ignored
+/// and the read end is used as fallback.
+fn observed_length_from_positions(
+    read_length: usize,
+    start: Option<&FlankMatch>,
+    end: Option<&FlankMatch>,
+) -> usize {
+    let start_pos =
+        start
+            .map(|m| m.position)
+            .unwrap_or(0);
+
+    let end_pos =
+        match end {
+            Some(m)
+                if m.position >= start_pos =>
+            {
+                m.position
+            }
+            _ => read_length,
+        };
+
+    end_pos.saturating_sub(start_pos)
+}
+
+
 /// Process paired FASTQ files.
 fn process(
     args: &Args,
@@ -1337,6 +1370,20 @@ fn process(
                         args.max_hamming,
                     );
 
+                let r1_length =
+                    observed_length_from_positions(
+                        canonical_r1_seq.len(),
+                        r1_result.start.as_ref(),
+                        r1_result.reverse_end.as_ref(),
+                    );
+
+                let r2_length =
+                    observed_length_from_positions(
+                        canonical_r2_seq.len(),
+                        r2_result.end.as_ref(),
+                        r2_result.reverse_start.as_ref(),
+                    );
+
                 /*
                  * ------------------------------------------------
                  * STEP 5: Pair category.
@@ -1366,8 +1413,8 @@ fn process(
                  */
                 histogram.add(
                     &pair_category,
-                    r1_result.observed_length,
-                    r2_result.observed_length,
+                    r1_length,
+                    r2_length,
                 );
 
                 /*
@@ -1408,8 +1455,7 @@ fn process(
                 )?;
 
                 writer.write_field(
-                    r1_result
-                        .observed_length
+                    r1_length
                         .to_string()
                 )?;
 
@@ -1424,11 +1470,6 @@ fn process(
 
                 write_optional_match(
                     &mut writer,
-                    r2_result.reverse_start.as_ref(),
-                )?;
-
-                write_optional_match(
-                    &mut writer,
                     r2_result.end.as_ref(),
                 )?;
 
@@ -1437,9 +1478,13 @@ fn process(
                     r2_result.reverse_start.as_ref(),
                 )?;
 
+                write_optional_match(
+                    &mut writer,
+                    r2_result.reverse_start.as_ref(),
+                )?;
+
                 writer.write_field(
-                    r2_result
-                        .observed_length
+                    r2_length
                         .to_string()
                 )?;
 
