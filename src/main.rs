@@ -1097,6 +1097,11 @@ fn process(
         "r1_start_match",
         "r1_start_hamming",
 
+        "r1_end_flank",
+        "r1_end_position",
+        "r1_end_match",
+        "r1_end_hamming",
+
         "r1_rev_end_flank",
         "r1_rev_end_position",
         "r1_rev_end_match",
@@ -1105,6 +1110,11 @@ fn process(
         "r1_length",
 
         "r2_category",
+
+        "r2_start_flank",
+        "r2_start_position",
+        "r2_start_match",
+        "r2_start_hamming",
 
         "r2_end_flank",
         "r2_end_position",
@@ -1392,6 +1402,11 @@ fn process(
                     r1_result.reverse_end.as_ref(),
                 )?;
 
+                write_optional_match(
+                    &mut writer,
+                    r1_result.reverse_end.as_ref(),
+                )?;
+
                 writer.write_field(
                     r1_result
                         .observed_length
@@ -1405,6 +1420,11 @@ fn process(
                  */
                 writer.write_field(
                     r2_result.category
+                )?;
+
+                write_optional_match(
+                    &mut writer,
+                    r2_result.reverse_start.as_ref(),
                 )?;
 
                 write_optional_match(
