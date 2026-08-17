@@ -623,55 +623,96 @@ fn reads_are_swapped(
             r1_sequence,
             start_flanks,
             max_hamming,
-        )
-        .is_some();
-
-    let r2_start =
-        find_forward_start(
-            r2_sequence,
-            start_flanks,
-            max_hamming,
-        )
-        .is_some();
+        );
 
     let r1_end =
         find_forward_end(
             r1_sequence,
             end_flanks,
             max_hamming,
-        )
-        .is_some();
+        );
+
+    let r2_start =
+        find_forward_start(
+            r2_sequence,
+            start_flanks,
+            max_hamming,
+        );
+
+    let r2_end =
+        find_forward_end(
+            r2_sequence,
+            end_flanks,
+            max_hamming,
+        );
 
     /*
-     * The canonical orientation is:
+     * Lower score = better match.
      *
-     *     R1 = START forward
-     *     R2 = END forward
+     * Missing match gets a large penalty.
+     */
+    let penalty = max_hamming + 1;
+
+    let match_score =
+        |m: &Option<FlankMatch>| -> usize {
+            match m {
+                Some(m) => m.hamming_distance,
+                None => penalty,
+            }
+        };
+
+    /*
+     * Canonical:
      *
-     * Therefore any of these observations means that the
-     * reads are reversed:
+     *     R1 = START
+     *     R2 = END
+     */
+    let canonical_score =
+        match_score(&r1_start)
+        + match_score(&r2_end);
+
+    /*
+     * Swapped:
      *
-     *     START forward in R2
-     *     END forward in R1
+     *     R1 = END
+     *     R2 = START
+     */
+    let swapped_score =
+        match_score(&r1_end)
+        + match_score(&r2_start);
+
+    /*
+     * Swap only when the swapped orientation is
+     * strictly better.
      */
     let swapped =
-        r2_start
-            || r1_end;
+        swapped_score < canonical_score;
 
-    if swapped {
-        eprintln!(
-            "Detected swapped read orientation: \
-             R1_START={} R2_START={} R1_END={} -> swapping reads",
-            r1_start,
-            r2_start,
-            r1_end,
-        );
-    }
+    eprintln!(
+        "Orientation check: \
+         R1_START={:?}, R1_END={:?}, \
+         R2_START={:?}, R2_END={:?}, \
+         canonical_score={}, swapped_score={}, \
+         swapped={}",
+        r1_start
+            .as_ref()
+            .map(|m| m.hamming_distance),
+        r1_end
+            .as_ref()
+            .map(|m| m.hamming_distance),
+        r2_start
+            .as_ref()
+            .map(|m| m.hamming_distance),
+        r2_end
+            .as_ref()
+            .map(|m| m.hamming_distance),
+        canonical_score,
+        swapped_score,
+        swapped,
+    );
 
     swapped
 }
-
-
 /// Classify canonical R1.
 ///
 /// Expected:
@@ -1284,18 +1325,10 @@ fn process(
                     );
 
                 let r1_length =
-                    observed_length_from_positions(
-                        canonical_r1_seq.len(),
-                        r1_result.start.as_ref(),
-                        r1_result.reverse_end.as_ref(),
-                    );
+                    r1_result.observed_length;
 
                 let r2_length =
-                    observed_length_from_positions(
-                        canonical_r2_seq.len(),
-                        r2_result.end.as_ref(),
-                        r2_result.reverse_start.as_ref(),
-                    );
+                    r2_result.observed_length;
 
                 /*
                  * ------------------------------------------------
