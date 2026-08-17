@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "amplicon-qc",
     version,
-    about = "Analyze amplicon flank positions and between-flank lengths in paired FASTQ files."
+    about = "Analyze amplicon flank positions and lengths in paired FASTQ files."
 )]
 struct Args {
     /// R1 FASTQ(.gz)
@@ -24,11 +24,11 @@ struct Args {
     #[arg(long)]
     r2: PathBuf,
 
-    /// Biological START flank file
+    /// START flank file
     #[arg(long)]
     start_flanks: PathBuf,
 
-    /// Biological END flank file
+    /// END flank file
     #[arg(long)]
     end_flanks: PathBuf,
 
@@ -54,7 +54,7 @@ struct Args {
 }
 
 
-/// A biological flank definition.
+/// A flank definition.
 #[derive(Debug, Clone)]
 struct Flank {
     name: String,
@@ -73,87 +73,86 @@ struct FlankMatch {
     /// Actual sequence found in the read.
     matched_sequence: Vec<u8>,
 
-    /// Hamming distance to the biological flank sequence
-    /// in the searched orientation.
+    /// Hamming distance to the flank definition.
     hamming_distance: usize,
 }
 
 
-/// Classification of one read based on biological flank identity.
+/// Result of classifying canonical R1.
 ///
-/// The classification is independent of whether the read is
-/// physically R1 or R2.
+/// Expected structure:
 ///
-/// A biological START flank is searched in both orientations:
+///     R1:
 ///
-///     START
-///     reverse-complement(START)
+///     START forward -> INSERT -> reverse END
 ///
-/// A biological END flank is also searched in both orientations:
+/// Possible categories:
 ///
-///     END
-///     reverse-complement(END)
+///     None
+///         No START forward flank found.
 ///
-/// A complete read can therefore appear in either physical
-/// orientation:
+///     R1_START
+///         START forward found, but no reverse END found.
 ///
-///     START -> insert -> END
+///     R1_START_revEND
+///         START forward and reverse END both found.
 ///
-/// or:
+/// The observed length is:
 ///
-///     END -> insert -> START
-///
-/// Both are classified as:
-///
-///     both
-///
-/// This is essential because R1 and R2 can be swapped and because
-/// a read itself may represent either strand.
+///     - end of reverse END, if reverse END exists
+///     - otherwise complete read length
 #[derive(Debug)]
-struct ReadResult {
+struct R1Result {
     category: &'static str,
 
-    /// Biological START flank, if found.
     start: Option<FlankMatch>,
 
-    /// Biological END flank, if found.
+    reverse_end: Option<FlankMatch>,
+
+    observed_length: usize,
+}
+
+
+/// Result of classifying canonical R2.
+///
+/// Expected structure:
+///
+///     R2:
+///
+///     END forward -> INSERT -> reverse START
+///
+/// Possible categories:
+///
+///     None
+///         No END forward flank found.
+///
+///     R2_END
+///         END forward found, but no reverse START found.
+///
+///     R2_END_revSTART
+///         END forward and reverse START both found.
+///
+/// The observed length is:
+///
+///     - end of reverse START, if reverse START exists
+///     - otherwise complete read length
+#[derive(Debug)]
+struct R2Result {
+    category: &'static str,
+
     end: Option<FlankMatch>,
 
-    /// Orientation in which the biological START flank
-    /// was actually found in the read.
-    ///
-    /// "forward"
-    /// "reverse_complement"
-    start_orientation: Option<&'static str>,
+    reverse_start: Option<FlankMatch>,
 
-    /// Orientation in which the biological END flank
-    /// was actually found in the read.
-    end_orientation: Option<&'static str>,
-
-    /// Physical position of the biological START flank.
-    start_position: Option<usize>,
-
-    /// Physical position of the biological END flank.
-    end_position: Option<usize>,
-
-    /// Length of sequence between the two biological flanks
-    /// when both are found.
-    ///
-    /// For single-flank reads:
-    ///
-    /// start_only:
-    ///     sequence after START if START is present
-    ///
-    /// end_only:
-    ///     sequence before END if END is present
-    ///
-    /// none:
-    ///     complete read length
     observed_length: usize,
 }
 
 
 /// Histogram of paired R1/R2 lengths.
+///
+/// Key:
+///
+///     (pair_category, r1_length, r2_length)
 #[derive(Debug)]
 struct Histogram {
     lengths: HashMap<(String, usize, usize), u64>,
@@ -199,13 +198,13 @@ impl PairCategories {
 
     fn add(
         &mut self,
-        r1: &ReadResult,
-        r2: &ReadResult,
+        r1_category: &'static str,
+        r2_category: &'static str,
     ) {
         let category =
-            normalized_pair_category(
-                r1.category,
-                r2.category,
+            pair_category(
+                r1_category,
+                r2_category,
             );
 
         *self
@@ -216,55 +215,30 @@ impl PairCategories {
 }
 
 
-/// Normalize the pair category so that swapping R1 and R2
-/// does not create a different biological category.
+/// Create the pair category.
+///
+/// R1 is always the canonical R1 after swap correction.
+/// R2 is always the canonical R2 after swap correction.
 ///
 /// Examples:
 ///
-///     start_only + end_only
-///         -> start_only__end_only
+///     R1_START + R2_END
+///         -> R1_START__R2_END
 ///
-///     end_only + start_only
-///         -> start_only__end_only
+///     R1_START_revEND + R2_END_revSTART
+///         -> R1_START_revEND__R2_END_revSTART
 ///
-///     both + start_only
-///         -> both__start_only
-///
-///     start_only + both
-///         -> both__start_only
-///
-///     none + end_only
-///         -> end_only__none
-///
-///     none + none
-///         -> none__none
-fn normalized_pair_category(
-    category_a: &'static str,
-    category_b: &'static str,
+///     None + R2_END
+///         -> None__R2_END
+fn pair_category(
+    r1_category: &'static str,
+    r2_category: &'static str,
 ) -> String {
-    fn rank(category: &str) -> usize {
-        match category {
-            "both" => 0,
-            "start_only" => 1,
-            "end_only" => 2,
-            "none" => 3,
-            _ => 99,
-        }
-    }
-
-    if rank(category_a) <= rank(category_b) {
-        format!(
-            "{}__{}",
-            category_a,
-            category_b
-        )
-    } else {
-        format!(
-            "{}__{}",
-            category_b,
-            category_a
-        )
-    }
+    format!(
+        "{}__{}",
+        r1_category,
+        r2_category
+    )
 }
 
 
@@ -294,24 +268,29 @@ fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 ///
 ///     flank_name    ACTGACTG
 fn read_flanks(path: &Path) -> Result<Vec<Flank>> {
-    let file = File::open(path)
-        .with_context(|| {
-            format!(
-                "Cannot open flank file {:?}",
-                path
-            )
-        })?;
+    let file =
+        File::open(path)
+            .with_context(|| {
+                format!(
+                    "Cannot open flank file {:?}",
+                    path
+                )
+            })?;
 
-    let reader = BufReader::new(file);
+    let reader =
+        BufReader::new(file);
 
-    let mut flanks = Vec::new();
+    let mut flanks =
+        Vec::new();
 
     for (line_no, line) in
         reader.lines().enumerate()
     {
-        let line = line?;
+        let line =
+            line?;
 
-        let line = line.trim();
+        let line =
+            line.trim();
 
         if line.is_empty()
             || line.starts_with('#')
@@ -319,8 +298,11 @@ fn read_flanks(path: &Path) -> Result<Vec<Flank>> {
             continue;
         }
 
-        let fields: Vec<&str> =
-            line.split_whitespace().collect();
+        let fields:
+            Vec<&str> =
+            line
+                .split_whitespace()
+                .collect();
 
         let (name, sequence) =
             match fields.len() {
@@ -344,11 +326,13 @@ fn read_flanks(path: &Path) -> Result<Vec<Flank>> {
                 ),
             };
 
-        let sequence: Vec<u8> = sequence
-            .as_bytes()
-            .iter()
-            .map(|b| b.to_ascii_uppercase())
-            .collect();
+        let sequence:
+            Vec<u8> =
+            sequence
+                .as_bytes()
+                .iter()
+                .map(|b| b.to_ascii_uppercase())
+                .collect();
 
         if sequence.is_empty() {
             bail!(
@@ -358,10 +342,12 @@ fn read_flanks(path: &Path) -> Result<Vec<Flank>> {
             );
         }
 
-        flanks.push(Flank {
-            name,
-            sequence,
-        });
+        flanks.push(
+            Flank {
+                name,
+                sequence,
+            }
+        );
     }
 
     if flanks.is_empty() {
@@ -376,9 +362,6 @@ fn read_flanks(path: &Path) -> Result<Vec<Flank>> {
 
 
 /// Return Hamming distance if <= max_distance.
-///
-/// Returns None once the allowed number of mismatches
-/// is exceeded.
 #[inline]
 fn hamming_distance(
     a: &[u8],
@@ -389,7 +372,8 @@ fn hamming_distance(
         return None;
     }
 
-    let mut distance = 0usize;
+    let mut distance =
+        0usize;
 
     for i in 0..a.len() {
         if a[i] != b[i] {
@@ -405,122 +389,100 @@ fn hamming_distance(
 }
 
 
-/// Find the best match of one biological flank in either
-/// orientation.
+/// Find the best match of a set of flanks in a read.
 ///
-/// Returns:
-///
-///     FlankMatch
-///     orientation
+/// The caller determines whether the flank sequences are
+/// forward or reverse-complemented.
 ///
 /// Ranking:
 ///
 /// 1. Lowest Hamming distance
 /// 2. Earliest position
-fn find_best_oriented_flank(
+fn find_best_flank(
     sequence: &[u8],
     flanks: &[Flank],
+    reverse_complemented: bool,
     max_hamming: usize,
-) -> Option<(FlankMatch, &'static str)> {
+) -> Option<FlankMatch> {
     let mut best:
-        Option<(FlankMatch, &'static str)> =
+        Option<FlankMatch> =
         None;
 
     for flank in flanks {
-        let reverse =
-            reverse_complement(
-                &flank.sequence
-            );
+        let oriented_sequence;
 
-        let orientations: [
-            (&[u8], &'static str);
-            2
-        ] = [
-            (
-                &flank.sequence,
-                "forward",
-            ),
-            (
-                &reverse,
-                "reverse_complement",
-            ),
-        ];
+        if reverse_complemented {
+            oriented_sequence =
+                reverse_complement(
+                    &flank.sequence
+                );
+        } else {
+            oriented_sequence =
+                flank.sequence.clone();
+        }
 
-        for (
-            oriented_sequence,
-            orientation,
-        ) in orientations
+        let k =
+            oriented_sequence.len();
+
+        if sequence.len() < k {
+            continue;
+        }
+
+        for position in
+            0..=(sequence.len() - k)
         {
-            let k =
-                oriented_sequence.len();
+            let candidate =
+                &sequence[
+                    position
+                        ..position + k
+                ];
 
-            if sequence.len() < k {
-                continue;
-            }
+            let distance =
+                match hamming_distance(
+                    candidate,
+                    &oriented_sequence,
+                    max_hamming,
+                ) {
+                    Some(d) => d,
+                    None => continue,
+                };
 
-            for position in
-                0..=(sequence.len() - k)
-            {
-                let candidate =
-                    &sequence[
-                        position
-                            ..position + k
-                    ];
+            let is_better =
+                match &best {
+                    None => true,
 
-                let distance =
-                    match hamming_distance(
-                        candidate,
-                        oriented_sequence,
-                        max_hamming,
-                    ) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-
-                let match_record =
-                    FlankMatch {
-                        flank_name:
-                            flank.name.clone(),
-
-                        position,
-
-                        matched_sequence:
-                            candidate.to_vec(),
-
-                        hamming_distance:
-                            distance,
-                    };
-
-                let is_better =
-                    match &best {
-                        None => true,
-
-                        Some((
-                            current,
-                            _,
-                        )) => {
+                    Some(current) => {
+                        distance
+                            < current
+                                .hamming_distance
+                            ||
+                        (
                             distance
-                                < current
+                                == current
                                     .hamming_distance
-                                ||
-                            (
-                                distance
-                                    == current
-                                        .hamming_distance
-                                &&
-                                position
-                                    < current
-                                        .position
-                            )
-                        }
-                    };
+                            &&
+                            position
+                                < current.position
+                        )
+                    }
+                };
 
-                if is_better {
-                    best = Some((
-                        match_record,
-                        orientation,
-                    ));
-                }
+            if is_better {
+                best =
+                    Some(
+                        FlankMatch {
+                            flank_name:
+                                flank.name.clone(),
+
+                            position,
+
+                            matched_sequence:
+                                candidate.to_vec(),
+
+                            hamming_distance:
+                                distance,
+                        }
+                    );
             }
         }
     }
@@ -529,855 +491,479 @@ fn find_best_oriented_flank(
 }
 
 
-/// Find a valid COMPLETE biological flank pair.
+/// Find the best forward START flank.
 ///
-/// IMPORTANT:
-///
-/// There are TWO valid physical orientations:
-///
-///     START -> END
-///
-/// and:
-///
-///     END -> START
-///
-/// Both represent a complete biological amplicon and are
-/// therefore classified as "both".
-///
-/// The returned fields are always biological:
-///
-///     start = biological START flank
-///     end   = biological END flank
-///
-/// regardless of their physical order in the read.
-///
-/// Ranking:
-///
-/// 1. Lowest combined Hamming distance
-/// 2. Smallest distance between the flanks
-/// 3. Earliest first flank
-/// 4. Earliest second flank
-fn find_ordered_biological_flanks(
+/// This is used specifically for orientation detection and
+/// canonical R1 classification.
+fn find_forward_start(
     sequence: &[u8],
     start_flanks: &[Flank],
-    end_flanks: &[Flank],
     max_hamming: usize,
-) -> Option<(
-    FlankMatch,
-    &'static str,
-    FlankMatch,
-    &'static str,
-)> {
-    let mut best:
-        Option<(
-            FlankMatch,
-            &'static str,
-            FlankMatch,
-            &'static str,
-        )> = None;
-
-    /*
-     * --------------------------------------------------------
-     * Case 1:
-     *
-     * Biological START -> biological END
-     * --------------------------------------------------------
-     */
-
-    for start_flank in start_flanks {
-        let start_reverse =
-            reverse_complement(
-                &start_flank.sequence
-            );
-
-        let start_orientations: [
-            (&[u8], &'static str);
-            2
-        ] = [
-            (
-                &start_flank.sequence,
-                "forward",
-            ),
-            (
-                &start_reverse,
-                "reverse_complement",
-            ),
-        ];
-
-        for (
-            start_sequence,
-            start_orientation,
-        ) in start_orientations
-        {
-            let start_len =
-                start_sequence.len();
-
-            if sequence.len() < start_len {
-                continue;
-            }
-
-            for start_position in
-                0..=(sequence.len() - start_len)
-            {
-                let start_candidate =
-                    &sequence[
-                        start_position
-                            ..start_position + start_len
-                    ];
-
-                let start_distance =
-                    match hamming_distance(
-                        start_candidate,
-                        start_sequence,
-                        max_hamming,
-                    ) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-
-                let start_match =
-                    FlankMatch {
-                        flank_name:
-                            start_flank.name.clone(),
-
-                        position:
-                            start_position,
-
-                        matched_sequence:
-                            start_candidate.to_vec(),
-
-                        hamming_distance:
-                            start_distance,
-                    };
-
-                let start_end =
-                    start_position
-                        + start_len;
-
-                for end_flank in end_flanks {
-                    let end_reverse =
-                        reverse_complement(
-                            &end_flank.sequence
-                        );
-
-                    let end_orientations: [
-                        (&[u8], &'static str);
-                        2
-                    ] = [
-                        (
-                            &end_flank.sequence,
-                            "forward",
-                        ),
-                        (
-                            &end_reverse,
-                            "reverse_complement",
-                        ),
-                    ];
-
-                    for (
-                        end_sequence,
-                        end_orientation,
-                    ) in end_orientations
-                    {
-                        let end_len =
-                            end_sequence.len();
-
-                        if sequence.len()
-                            < end_len
-                        {
-                            continue;
-                        }
-
-                        if start_end
-                            > sequence.len()
-                                - end_len
-                        {
-                            continue;
-                        }
-
-                        for end_position in
-                            start_end
-                                ..=(sequence.len()
-                                    - end_len)
-                        {
-                            let end_candidate =
-                                &sequence[
-                                    end_position
-                                        ..end_position
-                                            + end_len
-                                ];
-
-                            let end_distance =
-                                match hamming_distance(
-                                    end_candidate,
-                                    end_sequence,
-                                    max_hamming,
-                                ) {
-                                    Some(d) => d,
-                                    None => continue,
-                                };
-
-                            let end_match =
-                                FlankMatch {
-                                    flank_name:
-                                        end_flank
-                                            .name
-                                            .clone(),
-
-                                    position:
-                                        end_position,
-
-                                    matched_sequence:
-                                        end_candidate
-                                            .to_vec(),
-
-                                    hamming_distance:
-                                        end_distance,
-                                };
-
-                            let gap =
-                                end_position
-                                    - start_end;
-
-                            let current_score = (
-                                start_distance
-                                    + end_distance,
-                                gap,
-                                start_position,
-                                end_position,
-                            );
-
-                            let is_better =
-                                match &best {
-                                    None => true,
-
-                                    Some((
-                                        best_start,
-                                        _,
-                                        best_end,
-                                        _,
-                                    )) => {
-                                        let best_start_end =
-                                            best_start.position
-                                                + best_start
-                                                    .matched_sequence
-                                                    .len();
-
-                                        let best_gap =
-                                            best_end.position
-                                                .saturating_sub(
-                                                    best_start_end
-                                                );
-
-                                        let best_score = (
-                                            best_start
-                                                .hamming_distance
-                                                + best_end
-                                                    .hamming_distance,
-                                            best_gap,
-                                            best_start
-                                                .position,
-                                            best_end
-                                                .position,
-                                        );
-
-                                        current_score
-                                            < best_score
-                                    }
-                                };
-
-                            if is_better {
-                                best = Some((
-                                    start_match.clone(),
-                                    start_orientation,
-                                    end_match,
-                                    end_orientation,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /*
-     * --------------------------------------------------------
-     * Case 2:
-     *
-     * Biological END -> biological START
-     *
-     * This is the reverse physical orientation of the same
-     * biological amplicon.
-     *
-     * We return the fields in biological order:
-     *
-     *     start = START match
-     *     end   = END match
-     *
-     * even though END occurs physically first in the read.
-     * --------------------------------------------------------
-     */
-
-    for end_flank in end_flanks {
-        let end_reverse =
-            reverse_complement(
-                &end_flank.sequence
-            );
-
-        let end_orientations: [
-            (&[u8], &'static str);
-            2
-        ] = [
-            (
-                &end_flank.sequence,
-                "forward",
-            ),
-            (
-                &end_reverse,
-                "reverse_complement",
-            ),
-        ];
-
-        for (
-            end_sequence,
-            end_orientation,
-        ) in end_orientations
-        {
-            let end_len =
-                end_sequence.len();
-
-            if sequence.len() < end_len {
-                continue;
-            }
-
-            for end_position in
-                0..=(sequence.len() - end_len)
-            {
-                let end_candidate =
-                    &sequence[
-                        end_position
-                            ..end_position + end_len
-                    ];
-
-                let end_distance =
-                    match hamming_distance(
-                        end_candidate,
-                        end_sequence,
-                        max_hamming,
-                    ) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-
-                let end_match =
-                    FlankMatch {
-                        flank_name:
-                            end_flank.name.clone(),
-
-                        position:
-                            end_position,
-
-                        matched_sequence:
-                            end_candidate.to_vec(),
-
-                        hamming_distance:
-                            end_distance,
-                    };
-
-                let end_end =
-                    end_position
-                        + end_len;
-
-                for start_flank in start_flanks {
-                    let start_reverse =
-                        reverse_complement(
-                            &start_flank.sequence
-                        );
-
-                    let start_orientations: [
-                        (&[u8], &'static str);
-                        2
-                    ] = [
-                        (
-                            &start_flank.sequence,
-                            "forward",
-                        ),
-                        (
-                            &start_reverse,
-                            "reverse_complement",
-                        ),
-                    ];
-
-                    for (
-                        start_sequence,
-                        start_orientation,
-                    ) in start_orientations
-                    {
-                        let start_len =
-                            start_sequence.len();
-
-                        if sequence.len()
-                            < start_len
-                        {
-                            continue;
-                        }
-
-                        if end_end
-                            > sequence.len()
-                                - start_len
-                        {
-                            continue;
-                        }
-
-                        for start_position in
-                            end_end
-                                ..=(sequence.len()
-                                    - start_len)
-                        {
-                            let start_candidate =
-                                &sequence[
-                                    start_position
-                                        ..start_position
-                                            + start_len
-                                ];
-
-                            let start_distance =
-                                match hamming_distance(
-                                    start_candidate,
-                                    start_sequence,
-                                    max_hamming,
-                                ) {
-                                    Some(d) => d,
-                                    None => continue,
-                                };
-
-                            let start_match =
-                                FlankMatch {
-                                    flank_name:
-                                        start_flank
-                                            .name
-                                            .clone(),
-
-                                    position:
-                                        start_position,
-
-                                    matched_sequence:
-                                        start_candidate
-                                            .to_vec(),
-
-                                    hamming_distance:
-                                        start_distance,
-                                };
-
-                            let gap =
-                                start_position
-                                    - end_end;
-
-                            let current_score = (
-                                end_distance
-                                    + start_distance,
-                                gap,
-                                end_position,
-                                start_position,
-                            );
-
-                            let is_better =
-                                match &best {
-                                    None => true,
-
-                                    Some((
-                                        best_start,
-                                        _,
-                                        best_end,
-                                        _,
-                                    )) => {
-                                        let best_first_position =
-                                            best_start.position
-                                                .min(
-                                                    best_end.position
-                                                );
-
-                                        let best_last_position =
-                                            best_start.position
-                                                .max(
-                                                    best_end.position
-                                                );
-
-                                        let best_start_end =
-                                            best_end.position
-                                                + best_end
-                                                    .matched_sequence
-                                                    .len();
-
-                                        let best_gap =
-                                            if best_end.position
-                                                < best_start.position
-                                            {
-                                                best_start.position
-                                                    .saturating_sub(
-                                                        best_start_end
-                                                    )
-                                            } else {
-                                                best_start
-                                                    .position
-                                                    .saturating_sub(
-                                                        best_end.position
-                                                            + best_end
-                                                                .matched_sequence
-                                                                .len()
-                                                    )
-                                            };
-
-                                        let best_score = (
-                                            best_start
-                                                .hamming_distance
-                                                + best_end
-                                                    .hamming_distance,
-                                            best_gap,
-                                            best_first_position,
-                                            best_last_position,
-                                        );
-
-                                        current_score
-                                            < best_score
-                                    }
-                                };
-
-                            if is_better {
-                                /*
-                                 * IMPORTANT:
-                                 *
-                                 * Return biological START first,
-                                 * biological END second.
-                                 *
-                                 * Even though END physically occurs
-                                 * before START in the read.
-                                 */
-                                best = Some((
-                                    start_match,
-                                    start_orientation,
-                                    end_match,
-                                    end_orientation,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    best
+) -> Option<FlankMatch> {
+    find_best_flank(
+        sequence,
+        start_flanks,
+        false,
+        max_hamming,
+    )
 }
 
 
-/// Classify one read using biological flank identity.
+/// Find the best forward END flank.
 ///
-/// Rules:
-///
-///     START -> END = both
-///     END   -> START = both
-///
-/// Thus both physical orientations of an amplicon are treated
-/// identically.
-///
-/// The biological START and END matches are always returned in
-/// their biological roles, independent of physical order.
-fn classify_read(
+/// This is used specifically for orientation detection and
+/// canonical R2 classification.
+fn find_forward_end(
     sequence: &[u8],
+    end_flanks: &[Flank],
+    max_hamming: usize,
+) -> Option<FlankMatch> {
+    find_best_flank(
+        sequence,
+        end_flanks,
+        false,
+        max_hamming,
+    )
+}
+
+
+/// Find the reverse-complement END flank.
+///
+/// This is what we expect at the downstream end of canonical R1.
+fn find_reverse_end(
+    sequence: &[u8],
+    end_flanks: &[Flank],
+    max_hamming: usize,
+) -> Option<FlankMatch> {
+    find_best_flank(
+        sequence,
+        end_flanks,
+        true,
+        max_hamming,
+    )
+}
+
+
+/// Find the reverse-complement START flank.
+///
+/// This is what we expect at the downstream end of canonical R2.
+fn find_reverse_start(
+    sequence: &[u8],
+    start_flanks: &[Flank],
+    max_hamming: usize,
+) -> Option<FlankMatch> {
+    find_best_flank(
+        sequence,
+        start_flanks,
+        true,
+        max_hamming,
+    )
+}
+
+
+/// Determine whether the two input reads are swapped.
+///
+/// Expected canonical arrangement:
+///
+///     R1 = START forward
+///     R2 = END forward
+///
+/// Therefore:
+///
+///     START forward in input R2
+///
+/// and/or
+///
+///     END forward in input R1
+///
+/// indicates that the two reads are swapped.
+///
+/// We deliberately use the forward biological flanks for this
+/// decision, because this mirrors the orientation logic used
+/// during demultiplexing.
+///
+/// Returns:
+///
+///     true  = input reads must be swapped
+///     false = input reads already have canonical orientation
+fn reads_are_swapped(
+    r1_sequence: &[u8],
+    r2_sequence: &[u8],
     start_flanks: &[Flank],
     end_flanks: &[Flank],
     max_hamming: usize,
-) -> ReadResult {
-    let read_length =
-        sequence.len();
-
-    /*
-     * --------------------------------------------------------
-     * First: look for a complete biological pair.
-     *
-     * This now recognizes BOTH:
-     *
-     *     START -> END
-     *
-     * and:
-     *
-     *     END -> START
-     * --------------------------------------------------------
-     */
-
-    if let Some((
-        start,
-        start_orientation,
-        end,
-        end_orientation,
-    )) =
-        find_ordered_biological_flanks(
-            sequence,
+) -> bool {
+    let r1_start =
+        find_forward_start(
+            r1_sequence,
             start_flanks,
+            max_hamming,
+        )
+        .is_some();
+
+    let r2_start =
+        find_forward_start(
+            r2_sequence,
+            start_flanks,
+            max_hamming,
+        )
+        .is_some();
+
+    let r1_end =
+        find_forward_end(
+            r1_sequence,
             end_flanks,
             max_hamming,
         )
-    {
-        let start_end =
-            start.position
-                + start.matched_sequence.len();
-
-        let end_end =
-            end.position
-                + end.matched_sequence.len();
-
-        let observed_length =
-            if start.position < end.position {
-                /*
-                 * Physical order:
-                 *
-                 * START -> END
-                 */
-                end.position
-                    .saturating_sub(
-                        start_end
-                    )
-            } else {
-                /*
-                 * Physical order:
-                 *
-                 * END -> START
-                 */
-                start.position
-                    .saturating_sub(
-                        end_end
-                    )
-            };
-
-        return ReadResult {
-            category: "both",
-
-            start_position:
-                Some(start.position),
-
-            end_position:
-                Some(end.position),
-
-            start: Some(start),
-
-            end: Some(end),
-
-            start_orientation:
-                Some(start_orientation),
-
-            end_orientation:
-                Some(end_orientation),
-
-            observed_length,
-        };
-    }
+        .is_some();
 
     /*
-     * --------------------------------------------------------
-     * No complete biological pair.
+     * The canonical orientation is:
      *
-     * Search independently for START and END.
-     * --------------------------------------------------------
+     *     R1 = START forward
+     *     R2 = END forward
+     *
+     * Therefore any of these observations means that the
+     * reads are reversed:
+     *
+     *     START forward in R2
+     *     END forward in R1
      */
+    let swapped =
+        r2_start
+            || r1_end;
+
+    if swapped {
+        eprintln!(
+            "Detected swapped read orientation: \
+             R1_START={} R2_START={} R1_END={} -> swapping reads",
+            r1_start,
+            r2_start,
+            r1_end,
+        );
+    }
+
+    swapped
+}
+
+
+/// Classify canonical R1.
+///
+/// Expected:
+///
+///     START forward
+///
+/// followed by:
+///
+///     insert
+///
+/// followed optionally by:
+///
+///     reverse-complement END
+///
+/// Category:
+///
+///     None
+///     R1_START
+///     R1_START_revEND
+///
+/// Length:
+///
+///     if reverse END found:
+///         end.position + end.length
+///
+///     otherwise:
+///         complete read length
+fn classify_r1(
+    sequence: &[u8],
+    start_flanks: &[Flank],
+    end_flanks: &[Flank],
+    max_hamming: usize,
+) -> R1Result {
+    let read_length =
+        sequence.len();
 
     let start =
-        find_best_oriented_flank(
+        find_forward_start(
             sequence,
             start_flanks,
             max_hamming,
         );
 
-    let end =
-        find_best_oriented_flank(
+    let reverse_end =
+        find_reverse_end(
             sequence,
             end_flanks,
             max_hamming,
         );
 
-    match (start, end) {
-        /*
-         * ----------------------------------------------------
-         * NONE
-         * ----------------------------------------------------
-         */
-        (None, None) => ReadResult {
-            category: "none",
-
-            start: None,
-            end: None,
-
-            start_orientation: None,
-            end_orientation: None,
-
-            start_position: None,
-            end_position: None,
-
-            observed_length:
-                read_length,
-        },
-
-        /*
-         * ----------------------------------------------------
-         * START ONLY
-         * ----------------------------------------------------
-         */
-        (
-            Some((
-                start,
-                start_orientation,
-            )),
-            None,
-        ) => {
-            let start_end =
-                start.position
-                    + start.matched_sequence.len();
-
-            let observed_length =
-                read_length
-                    .saturating_sub(
-                        start_end
-                    );
-
-            ReadResult {
-                category: "start_only",
-
-                start_position:
-                    Some(start.position),
-
-                end_position: None,
-
-                start: Some(start),
-                end: None,
-
-                start_orientation:
-                    Some(start_orientation),
-
-                end_orientation: None,
-
-                observed_length,
-            }
-        }
-
-        /*
-         * ----------------------------------------------------
-         * END ONLY
-         * ----------------------------------------------------
-         */
-        (
-            None,
-            Some((
-                end,
-                end_orientation,
-            )),
-        ) => {
-            let observed_length =
-                end.position;
-
-            ReadResult {
-                category: "end_only",
-
-                start_position: None,
-
-                end_position:
-                    Some(end.position),
+    match start {
+        None => {
+            /*
+             * There is no canonical START forward flank.
+             *
+             * We call this None, even if an unexpected reverse
+             * END happens to occur. Such unexpected matches remain
+             * visible in the TSV.
+             */
+            R1Result {
+                category: "None",
 
                 start: None,
-                end: Some(end),
 
-                start_orientation: None,
+                reverse_end,
 
-                end_orientation:
-                    Some(end_orientation),
-
-                observed_length,
+                observed_length:
+                    read_length,
             }
         }
 
-        /*
-         * ----------------------------------------------------
-         * BOTH FLANK TYPES FOUND, BUT NO VALID ORDERED PAIR
-         * ----------------------------------------------------
-         *
-         * This is an ambiguous / conflicting situation.
-         *
-         * We do NOT silently discard the END flank anymore.
-         *
-         * Instead we choose the biological flank pair with
-         * the best independent matches and classify according
-         * to which flank is the better anchor.
-         *
-         * In practice this should be rare if the flank
-         * definitions are sufficiently specific.
-         * ----------------------------------------------------
-         */
-        (
-            Some((
-                start,
-                start_orientation,
-            )),
-            Some((
-                end,
-                end_orientation,
-            )),
-        ) => {
-            let start_quality =
-                start.hamming_distance;
+        Some(start) => {
+            match reverse_end {
+                None => {
+                    /*
+                     * START is present but the read ends before
+                     * reaching reverse END.
+                     */
+                    R1Result {
+                        category: "R1_START",
 
-            let end_quality =
-                end.hamming_distance;
+                        start:
+                            Some(start),
 
-            if start_quality <= end_quality {
-                let start_end =
-                    start.position
-                        + start.matched_sequence.len();
+                        reverse_end:
+                            None,
 
-                let observed_length =
-                    read_length
-                        .saturating_sub(
-                            start_end
-                        );
-
-                ReadResult {
-                    category: "start_only",
-
-                    start_position:
-                        Some(start.position),
-
-                    end_position: None,
-
-                    start: Some(start),
-                    end: None,
-
-                    start_orientation:
-                        Some(start_orientation),
-
-                    end_orientation: None,
-
-                    observed_length,
+                        observed_length:
+                            read_length,
+                    }
                 }
-            } else {
-                let observed_length =
-                    end.position;
 
-                ReadResult {
-                    category: "end_only",
+                Some(reverse_end) => {
+                    /*
+                     * Length is the complete sequence from
+                     * read start through the END of reverse END.
+                     *
+                     * Example:
+                     *
+                     * START = positions 0..20
+                     * insert = positions 20..100
+                     * revEND = positions 100..120
+                     *
+                     * length = 120
+                     */
+                    let reverse_end_end =
+                        reverse_end.position
+                            + reverse_end
+                                .matched_sequence
+                                .len();
 
-                    start_position: None,
+                    /*
+                     * Only call this a valid R1_START_revEND
+                     * arrangement if reverse END occurs after
+                     * START.
+                     *
+                     * This prevents a reverse END occurring
+                     * upstream from being interpreted as the
+                     * downstream flank.
+                     */
+                    let start_end =
+                        start.position
+                            + start
+                                .matched_sequence
+                                .len();
 
-                    end_position:
-                        Some(end.position),
+                    if reverse_end.position
+                        >= start_end
+                    {
+                        R1Result {
+                            category:
+                                "R1_START_revEND",
 
-                    start: None,
-                    end: Some(end),
+                            start:
+                                Some(start),
 
-                    start_orientation: None,
+                            reverse_end:
+                                Some(reverse_end),
 
-                    end_orientation:
-                        Some(end_orientation),
+                            observed_length:
+                                reverse_end_end,
+                        }
+                    } else {
+                        /*
+                         * Reverse END exists, but not in the
+                         * expected downstream position.
+                         *
+                         * We therefore retain the START-only
+                         * classification.
+                         */
+                        R1Result {
+                            category:
+                                "R1_START",
 
-                    observed_length,
+                            start:
+                                Some(start),
+
+                            reverse_end:
+                                Some(reverse_end),
+
+                            observed_length:
+                                read_length,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+/// Classify canonical R2.
+///
+/// Expected:
+///
+///     END forward
+///
+/// followed by:
+///
+///     insert
+///
+/// followed optionally by:
+///
+///     reverse-complement START
+///
+/// Category:
+///
+///     None
+///     R2_END
+///     R2_END_revSTART
+///
+/// Length:
+///
+///     if reverse START found:
+///         end.position + start.length
+///
+///     otherwise:
+///         complete read length
+fn classify_r2(
+    sequence: &[u8],
+    start_flanks: &[Flank],
+    end_flanks: &[Flank],
+    max_hamming: usize,
+) -> R2Result {
+    let read_length =
+        sequence.len();
+
+    let end =
+        find_forward_end(
+            sequence,
+            end_flanks,
+            max_hamming,
+        );
+
+    let reverse_start =
+        find_reverse_start(
+            sequence,
+            start_flanks,
+            max_hamming,
+        );
+
+    match end {
+        None => {
+            /*
+             * No canonical END forward flank.
+             *
+             * Again, an unexpected reverse START is retained
+             * in the TSV if present.
+             */
+            R2Result {
+                category: "None",
+
+                end: None,
+
+                reverse_start,
+
+                observed_length:
+                    read_length,
+            }
+        }
+
+        Some(end) => {
+            match reverse_start {
+                None => {
+                    /*
+                     * END is present but reverse START is not
+                     * reached within the read.
+                     */
+                    R2Result {
+                        category:
+                            "R2_END",
+
+                        end:
+                            Some(end),
+
+                        reverse_start:
+                            None,
+
+                        observed_length:
+                            read_length,
+                    }
+                }
+
+                Some(reverse_start) => {
+                    let reverse_start_end =
+                        reverse_start.position
+                            + reverse_start
+                                .matched_sequence
+                                .len();
+
+                    let end_end =
+                        end.position
+                            + end
+                                .matched_sequence
+                                .len();
+
+                    /*
+                     * Reverse START must occur downstream
+                     * of forward END.
+                     */
+                    if reverse_start.position
+                        >= end_end
+                    {
+                        R2Result {
+                            category:
+                                "R2_END_revSTART",
+
+                            end:
+                                Some(end),
+
+                            reverse_start:
+                                Some(reverse_start),
+
+                            observed_length:
+                                reverse_start_end,
+                        }
+                    } else {
+                        /*
+                         * Reverse START exists but is upstream
+                         * of the expected END.
+                         *
+                         * Retain END-only classification.
+                         */
+                        R2Result {
+                            category:
+                                "R2_END",
+
+                            end:
+                                Some(end),
+
+                            reverse_start:
+                                Some(reverse_start),
+
+                            observed_length:
+                                read_length,
+                        }
+                    }
                 }
             }
         }
@@ -1389,13 +975,13 @@ fn classify_read(
 ///
 /// Examples:
 ///
-/// @read123/1
-/// @read123/2
+///     read123/1 -> read123
+///     read123/2 -> read123
 ///
-/// become:
-///
-/// read123
-fn normalize_read_id(id: &[u8]) -> String {
+///     read123 1:N:0:1 -> read123
+fn normalize_read_id(
+    id: &[u8],
+) -> String {
     let id =
         String::from_utf8_lossy(id);
 
@@ -1408,42 +994,44 @@ fn normalize_read_id(id: &[u8]) -> String {
 }
 
 
-/// Write an optional flank match to the TSV.
+/// Write an optional flank match.
+///
+/// Fields:
+///
+///     flank name
+///     position
+///     matched sequence
+///     Hamming distance
 fn write_optional_match(
     writer:
         &mut csv::Writer<BufWriter<File>>,
     m: Option<&FlankMatch>,
-    orientation: Option<&'static str>,
 ) -> Result<()> {
     match m {
         Some(m) => {
             writer.write_field(
-                &m.flank_name,
+                &m.flank_name
             )?;
 
             writer.write_field(
-                m.position.to_string(),
+                m.position
+                    .to_string()
             )?;
 
             writer.write_field(
                 String::from_utf8_lossy(
-                    &m.matched_sequence,
+                    &m.matched_sequence
                 )
-                .as_bytes(),
+                .as_bytes()
             )?;
 
             writer.write_field(
                 m.hamming_distance
-                    .to_string(),
-            )?;
-
-            writer.write_field(
-                orientation.unwrap_or(""),
+                    .to_string()
             )?;
         }
 
         None => {
-            writer.write_field("")?;
             writer.write_field("")?;
             writer.write_field("")?;
             writer.write_field("")?;
@@ -1496,37 +1084,41 @@ fn process(
             );
 
     /*
-     * Header.
+     * TSV header.
      */
     writer.write_record([
         "read_id",
         "pair_category",
 
         "r1_category",
+
         "r1_start_flank",
         "r1_start_position",
         "r1_start_match",
         "r1_start_hamming",
-        "r1_start_orientation",
-        "r1_end_flank",
-        "r1_end_position",
-        "r1_end_match",
-        "r1_end_hamming",
-        "r1_end_orientation",
-        "r1_observed_length",
+
+        "r1_rev_end_flank",
+        "r1_rev_end_position",
+        "r1_rev_end_match",
+        "r1_rev_end_hamming",
+
+        "r1_length",
 
         "r2_category",
-        "r2_start_flank",
-        "r2_start_position",
-        "r2_start_match",
-        "r2_start_hamming",
-        "r2_start_orientation",
+
         "r2_end_flank",
         "r2_end_position",
         "r2_end_match",
         "r2_end_hamming",
-        "r2_end_orientation",
-        "r2_observed_length",
+
+        "r2_rev_start_flank",
+        "r2_rev_start_position",
+        "r2_rev_start_match",
+        "r2_rev_start_hamming",
+
+        "r2_length",
+
+        "reads_swapped",
     ])?;
 
     let mut pair_categories =
@@ -1538,7 +1130,13 @@ fn process(
     let mut read_count =
         0u64;
 
+    let mut swapped_count =
+        0u64;
+
     loop {
+        /*
+         * Optional processing limit.
+         */
         if let Some(limit) =
             args.limit
         {
@@ -1558,14 +1156,14 @@ fn process(
             r2_record,
         ) {
             /*
-             * Both files ended normally.
+             * Both FASTQ files finished.
              */
             (None, None) => {
                 break;
             }
 
             /*
-             * R1 ended too early.
+             * R1 shorter than R2.
              */
             (None, Some(_)) => {
                 bail!(
@@ -1574,7 +1172,7 @@ fn process(
             }
 
             /*
-             * R2 ended too early.
+             * R2 shorter than R1.
              */
             (Some(_), None) => {
                 bail!(
@@ -1583,7 +1181,7 @@ fn process(
             }
 
             /*
-             * Both reads available.
+             * Both records available.
              */
             (
                 Some(Ok(r1)),
@@ -1600,8 +1198,8 @@ fn process(
                     );
 
                 /*
-                 * Make sure R1 and R2 still belong to
-                 * the same pair.
+                 * Verify that R1 and R2 belong to the
+                 * same read pair.
                  */
                 if r1_id != r2_id {
                     bail!(
@@ -1615,67 +1213,146 @@ fn process(
 
                 /*
                  * Normalize sequences to uppercase.
+                 *
+                 * IMPORTANT:
+                 *
+                 * We do NOT reverse-complement either read.
+                 *
+                 * If the files are swapped, we simply swap
+                 * which sequence is considered canonical R1
+                 * and which sequence is considered canonical R2.
                  */
-                let r1_seq =
+                let input_r1_seq =
                     r1.normalize(false);
 
-                let r2_seq =
+                let input_r2_seq =
                     r2.normalize(false);
 
                 /*
-                 * IMPORTANT:
+                 * ------------------------------------------------
+                 * STEP 1: Detect whether the FASTQ pair is swapped.
+                 * ------------------------------------------------
                  *
-                 * Both reads are classified against the
-                 * SAME biological flank definitions.
+                 * Canonical:
                  *
-                 * We search both orientations.
+                 *     R1 = START forward
+                 *     R2 = END forward
                  *
-                 * Therefore we do NOT assume:
+                 * Swapped evidence:
                  *
-                 *     R1 = START -> END
-                 *     R2 = END -> START
+                 *     START forward in input R2
                  *
-                 * and we do NOT assume that the input files
-                 * are necessarily in the expected orientation.
+                 *     OR
+                 *
+                 *     END forward in input R1
                  */
-                let r1_result =
-                    classify_read(
-                        &r1_seq,
+                let swapped =
+                    reads_are_swapped(
+                        &input_r1_seq,
+                        &input_r2_seq,
                         start_flanks,
                         end_flanks,
                         args.max_hamming,
                     );
 
-                let r2_result =
-                    classify_read(
-                        &r2_seq,
+                if swapped {
+                    swapped_count += 1;
+                }
+
+                /*
+                 * ------------------------------------------------
+                 * STEP 2: Establish canonical R1/R2.
+                 * ------------------------------------------------
+                 *
+                 * No sequence transformation happens here.
+                 *
+                 * We only choose which physical read belongs
+                 * to canonical R1 and canonical R2.
+                 */
+                let (
+                    canonical_r1_seq,
+                    canonical_r2_seq,
+                ) =
+                    if swapped {
+                        (
+                            &input_r2_seq,
+                            &input_r1_seq,
+                        )
+                    } else {
+                        (
+                            &input_r1_seq,
+                            &input_r2_seq,
+                        )
+                    };
+
+                /*
+                 * ------------------------------------------------
+                 * STEP 3: Classify canonical R1.
+                 * ------------------------------------------------
+                 *
+                 * Expected:
+                 *
+                 *     START forward
+                 *
+                 * followed optionally by:
+                 *
+                 *     reverse END
+                 */
+                let r1_result =
+                    classify_r1(
+                        canonical_r1_seq,
                         start_flanks,
                         end_flanks,
                         args.max_hamming,
                     );
 
                 /*
-                 * Normalize pair category.
+                 * ------------------------------------------------
+                 * STEP 4: Classify canonical R2.
+                 * ------------------------------------------------
                  *
-                 * R1/R2 order does not matter here.
+                 * Expected:
+                 *
+                 *     END forward
+                 *
+                 * followed optionally by:
+                 *
+                 *     reverse START
+                 */
+                let r2_result =
+                    classify_r2(
+                        canonical_r2_seq,
+                        start_flanks,
+                        end_flanks,
+                        args.max_hamming,
+                    );
+
+                /*
+                 * ------------------------------------------------
+                 * STEP 5: Pair category.
+                 * ------------------------------------------------
+                 *
+                 * R1 and R2 are now canonical, so the category
+                 * has a fixed biological meaning.
                  */
                 let pair_category =
-                    normalized_pair_category(
+                    pair_category(
                         r1_result.category,
                         r2_result.category,
                     );
 
                 pair_categories.add(
-                    &r1_result,
-                    &r2_result,
+                    r1_result.category,
+                    r2_result.category,
                 );
 
                 /*
-                 * Keep physical R1/R2 lengths separate.
+                 * ------------------------------------------------
+                 * STEP 6: Histogram.
+                 * ------------------------------------------------
                  *
-                 * This means the histogram still tells us
-                 * which length belonged to the physical R1
-                 * and which belonged to physical R2.
+                 * Store the two lengths belonging to the same
+                 * read pair.
                  */
                 histogram.add(
                     &pair_category,
@@ -1685,76 +1362,81 @@ fn process(
 
                 /*
                  * ------------------------------------------------
-                 * TSV
+                 * STEP 7: Write TSV.
                  * ------------------------------------------------
                  */
-
                 writer.write_field(
-                    &r1_id,
+                    &r1_id
                 )?;
 
                 writer.write_field(
-                    &pair_category,
+                    &pair_category
                 )?;
 
                 /*
                  * -------------------------
-                 * R1
+                 * Canonical R1
                  * -------------------------
                  */
-
                 writer.write_field(
-                    r1_result.category,
+                    r1_result.category
                 )?;
 
                 write_optional_match(
                     &mut writer,
                     r1_result.start.as_ref(),
-                    r1_result.start_orientation,
                 )?;
 
                 write_optional_match(
                     &mut writer,
-                    r1_result.end.as_ref(),
-                    r1_result.end_orientation,
+                    r1_result.reverse_end.as_ref(),
                 )?;
 
                 writer.write_field(
                     r1_result
                         .observed_length
-                        .to_string(),
+                        .to_string()
                 )?;
 
                 /*
                  * -------------------------
-                 * R2
+                 * Canonical R2
                  * -------------------------
                  */
-
                 writer.write_field(
-                    r2_result.category,
-                )?;
-
-                write_optional_match(
-                    &mut writer,
-                    r2_result.start.as_ref(),
-                    r2_result.start_orientation,
+                    r2_result.category
                 )?;
 
                 write_optional_match(
                     &mut writer,
                     r2_result.end.as_ref(),
-                    r2_result.end_orientation,
+                )?;
+
+                write_optional_match(
+                    &mut writer,
+                    r2_result.reverse_start.as_ref(),
                 )?;
 
                 writer.write_field(
                     r2_result
                         .observed_length
-                        .to_string(),
+                        .to_string()
                 )?;
 
                 /*
-                 * Finish exactly one TSV row.
+                 * Record whether physical input R1/R2 had
+                 * to be swapped.
+                 */
+                writer.write_field(
+                    if swapped {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                )?;
+
+                /*
+                 * Finish TSV row.
                  */
                 writer.write_record(
                     None::<&[u8]>
@@ -1797,7 +1479,7 @@ fn process(
     )?;
 
     /*
-     * Write normalized pair categories.
+     * Write pair categories.
      */
     write_pair_categories(
         &args.categories,
@@ -1809,11 +1491,31 @@ fn process(
         read_count
     );
 
+    eprintln!(
+        "Detected swapped orientation in {} read pairs ({:.2}%)",
+        swapped_count,
+        if read_count > 0 {
+            100.0 * swapped_count as f64
+                / read_count as f64
+        } else {
+            0.0
+        }
+    );
+
     Ok(())
 }
 
 
 /// Write paired R1/R2 length combinations.
+///
+/// Output:
+///
+///     pair_category    r1_length    r2_length    count
+///
+/// The lengths are canonical:
+///
+///     r1_length = canonical R1 length
+///     r2_length = canonical R2 length
 fn write_histogram(
     path: &Path,
     histogram: &Histogram,
@@ -1872,7 +1574,7 @@ fn write_histogram(
 }
 
 
-/// Write normalized joint pair categories.
+/// Write pair-category counts.
 fn write_pair_categories(
     path: &Path,
     categories: &PairCategories,
@@ -1926,7 +1628,7 @@ fn main() -> Result<()> {
         Args::parse();
 
     eprintln!(
-        "Reading biological flank definitions..."
+        "Reading flank definitions..."
     );
 
     let start_flanks =
@@ -1940,7 +1642,7 @@ fn main() -> Result<()> {
         )?;
 
     eprintln!(
-        "Loaded {} biological START flanks and {} biological END flanks",
+        "Loaded {} START flanks and {} END flanks",
         start_flanks.len(),
         end_flanks.len()
     );
@@ -1960,30 +1662,25 @@ fn main() -> Result<()> {
     }
 
     /*
-     * There are intentionally NO separate R1/R2 flank
-     * definitions anymore.
+     * No separate R1/R2 flank definitions are needed.
      *
-     * Every read is compared against:
+     * The biological definitions are:
      *
-     *     biological START
-     *     biological END
+     *     START
+     *     END
      *
-     * in both:
+     * Orientation handling is explicit:
      *
-     *     forward
-     *     reverse-complement
+     *     canonical R1:
+     *         START forward
+     *         reverse END
      *
-     * orientations.
+     *     canonical R2:
+     *         END forward
+     *         reverse START
      *
-     * Consequently:
-     *
-     *     START -> END
-     *
-     * and:
-     *
-     *     END -> START
-     *
-     * are both recognized as a complete "both" read.
+     * Before classification we detect whether the physical
+     * FASTQ files have been swapped.
      */
     process(
         &args,
